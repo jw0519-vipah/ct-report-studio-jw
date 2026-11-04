@@ -1,0 +1,11 @@
+{
+  "name": "CT Report Studio JW v1",
+  "short_name": "CT Report JW",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#0e2441",
+  "icons": [
+    {"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}

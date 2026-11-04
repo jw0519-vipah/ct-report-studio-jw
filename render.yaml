@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ct-report-studio-jw-v1
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-luna
