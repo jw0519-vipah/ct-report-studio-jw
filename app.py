@@ -169,7 +169,12 @@ Findings & comments
 - 추가 설명/해부학적 관계/측정/조영 양상/임상적 의미/추적 권고도 같은 번호 아래 - 로 작성
 
 Dx & DDx
-- 간결한 영상학적 진단 및 감별진단
+- 반드시 영어 의학용어만 사용한다.
+- Findings를 다시 설명하지 말고 질환명/진단명 그 자체만 간결하게 작성한다.
+- 각 항목은 실제 하이픈(-)으로 시작하는 짧은 diagnosis label이어야 한다.
+- 한글, 완전한 설명문, 병변 위치/크기/조영양상 반복, colon(:)을 사용하지 않는다.
+- 필요한 경우에만 susp., less likely, metastasis, invasion 정도의 짧은 수식어를 허용한다.
+- 예: Prostatic neoplasia / UB neck invasion / Pulmonary metastasis / Regional LN metastasis susp. / UB calculi / Renal cyst / Cholestasis
 
 Impression
 사용자가 Impression 포함을 요청한 경우에만 작성한다.
@@ -202,6 +207,108 @@ def _extract_output_text(body: dict[str, Any]) -> str:
                 if isinstance(text, str) and text.strip():
                     chunks.append(text.strip())
     return "\n".join(chunks).strip()
+
+
+DX_NORMALIZE_PROMPT = r"""
+You are editing ONLY the Dx & DDx section of a veterinary CT report in Jang Jin-won style.
+Return ONLY the following block, with no code fence and no extra commentary:
+
+Dx & DDx
+- diagnosis
+- diagnosis
+
+Hard rules:
+- English medical terminology only. Absolutely no Korean/Hangul.
+- Write disease/diagnosis names themselves, not explanatory sentences and not lesion descriptions.
+- Keep each item short and concise, preferably 2-6 words.
+- Do not repeat location, size, attenuation, enhancement pattern, or descriptive imaging morphology from Findings.
+- Do not use colon (:).
+- Use one diagnosis per hyphen line.
+- Short qualifiers such as susp., less likely, metastasis, invasion are allowed when clinically necessary.
+- Preserve only diagnoses that are supported by the supplied report. Do not invent new findings.
+- Prefer terms such as: Prostatic neoplasia, UB neck invasion, Pulmonary metastasis, Regional LN metastasis susp., UB calculi, Renal cyst, Cholestasis.
+""".strip()
+
+
+def _split_dx_section(report: str) -> tuple[str, str, str] | None:
+    marker = "Dx & DDx"
+    start = report.find(marker)
+    if start < 0:
+        return None
+    body_start = start + len(marker)
+    tail_candidates = []
+    for tail_marker in ("\nImpression", "\nRadiologist :", "\nRadiologist:"):
+        i = report.find(tail_marker, body_start)
+        if i >= 0:
+            tail_candidates.append(i)
+    end = min(tail_candidates) if tail_candidates else len(report)
+    return report[:start], report[start:end].strip(), report[end:]
+
+
+def _dx_needs_normalization(report: str) -> bool:
+    parts = _split_dx_section(report)
+    if not parts:
+        return True
+    _, dx_block, _ = parts
+    lines = [ln.strip() for ln in dx_block.splitlines()[1:] if ln.strip()]
+    if not lines:
+        return True
+    for line in lines:
+        text = line[1:].strip() if line.startswith("-") else line
+        if not line.startswith("-"):
+            return True
+        if any("가" <= ch <= "힣" for ch in text):
+            return True
+        if ":" in text:
+            return True
+        # Long lines are usually lesion-description sentences rather than concise diagnosis labels.
+        if len(text.split()) > 9:
+            return True
+        lowered = text.lower()
+        verbose_phrases = (
+            "adjacent to", "located in", "measuring", "contrast-enhancing",
+            "soft tissue mass", "considered", "differential diagnosis",
+            "cannot be excluded", "need to differentiate", "arising from",
+        )
+        if any(p in lowered for p in verbose_phrases):
+            return True
+    return False
+
+
+def _replace_dx_section(report: str, normalized_dx: str) -> str:
+    parts = _split_dx_section(report)
+    if not parts:
+        return report
+    before, _, after = parts
+    normalized_dx = normalized_dx.strip()
+    if not normalized_dx.startswith("Dx & DDx"):
+        normalized_dx = "Dx & DDx\n" + normalized_dx
+    return before + normalized_dx + ("\n" if after and not after.startswith("\n") else "") + after
+
+
+async def _normalize_dx_ddx(report: str, model: str) -> str:
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": DX_NORMALIZE_PROMPT}]},
+            {"role": "user", "content": [{"type": "input_text", "text": report}]},
+        ],
+        "max_output_tokens": 500,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=45.0, write=20.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.post(f"{OPENAI_BASE_URL}/v1/responses", headers=_headers(), json=payload)
+    except httpx.HTTPError:
+        return report
+    if not resp.is_success:
+        return report
+    normalized = _extract_output_text(_safe_json(resp))
+    if not normalized:
+        return report
+    candidate = _replace_dx_section(report, normalized)
+    # Never replace a usable report with a normalization result that still violates the hard rules.
+    return candidate if not _dx_needs_normalization(candidate) else report
 
 
 @app.get("/")
@@ -292,6 +399,11 @@ async def create_report(
         return _api_error(502, "empty_response", "빈 응답",
                           "OpenAI 연결은 성공했지만 소견서 텍스트를 받지 못했습니다. 모델 ID와 Responses API 지원 여부를 확인해 주세요.",
                           request_id=resp.headers.get("x-request-id"))
+
+    # Safety layer for Jang Jin-won style: Dx & DDx must be concise English diagnosis labels only.
+    if _dx_needs_normalization(report):
+        report = await _normalize_dx_ddx(report, payload["model"])
+
     return {
         "ok": True,
         "report": report,
